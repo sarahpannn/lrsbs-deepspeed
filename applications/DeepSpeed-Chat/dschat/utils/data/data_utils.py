@@ -65,6 +65,20 @@ def get_raw_dataset(dataset_name, output_path, seed, local_rank):
     elif "lmqg/qag_jaquad" in dataset_name:
         return raw_datasets.LmqgQagjaquadDataset(output_path, seed, local_rank,
                                                  dataset_name)
+    
+    elif "sarahpann/PRM800K_simplified" in dataset_name:
+        return raw_datasets.prm800ksimplified(output_path, seed, local_rank,
+                                                                dataset_name)
+    elif "sarahpann/PRM800K" in dataset_name:
+        return raw_datasets.prm800ktrain(output_path, seed, local_rank,
+                                                         dataset_name)
+    
+    elif "sarahpann/MATH" in dataset_name:
+        return raw_datasets.MATH(output_path, seed, local_rank,
+                                                         dataset_name)
+    elif "sarahpann/AMPS" in dataset_name:
+        return raw_datasets.AMPS(output_path, seed, local_rank,
+                                                            dataset_name)
     elif "local/jsonfile" in dataset_name:
         chat_path = os.path.abspath(
             os.path.join(os.path.dirname(__file__), os.path.pardir,
@@ -101,6 +115,7 @@ def get_raw_dataset_split_index(local_rank,
                                 split_index,
                                 data_size,
                                 rebuild=False):
+    # index_file_name = f"{output_path}/{dataset_name}_seed{seed}_{split_name}_{data_split}_{2}.npy"
     index_file_name = f"{output_path}/{dataset_name}_seed{seed}_{split_name}_{data_split}_{split_index}.npy"
     # reindex each time when using local jsonfile since it's more likely to get modified
     if rebuild or (not os.path.isfile(index_file_name)) or (dataset_name
@@ -119,6 +134,7 @@ def get_raw_dataset_split_index(local_rank,
 
         shuffle_idx = get_shuffle_idx(seed, data_size)
         for split_i in range(len(splits)):
+            # shuffle_idx_split_file_name = f"{output_path}/{dataset_name}_seed{seed}_{split_name}_{2}_{split_i}.npy"
             shuffle_idx_split_file_name = f"{output_path}/{dataset_name}_seed{seed}_{split_name}_{data_split}_{split_i}.npy"
             shuffle_idx_split = shuffle_idx[
                 splits_index[split_i]:splits_index[split_i + 1]]
@@ -159,6 +175,42 @@ class PromptDataset(Dataset):
         elif self.train_phase == 3:
             return self.prompt_dataset[idx]["input_ids"],self.prompt_dataset[idx]["attention_mask"], \
                 self.pad_token_id
+        elif self.train_phase == "DPO":
+            return self.prompt_dataset[idx]["input_ids"],self.prompt_dataset[idx]["attention_mask"], \
+                self.prompt_dataset[idx]["label_tensor"]
+        
+
+def _tokenize_inputs(text, clean_text, tokenizer, max_len=1024):
+    t_text = tokenizer(text, return_tensors='pt')
+
+    # TODO: get rid of padding always to the max length
+    # t_clean_text = tokenizer(text, padding="max_length", truncation=True, maximum_length=max_len)
+    t_clean_text = tokenizer(clean_text, truncation=True, max_length=max_len, return_tensors='pt')
+
+    mask = torch.eq(t_text['input_ids'], 1) # 1 corresponds to bos token
+    indices = torch.nonzero(mask, as_tuple=True)[1]
+
+    shifted_indices = indices - (2 * (1 + torch.arange(indices.size(0))))
+
+    mask = shifted_indices < t_clean_text['input_ids'].shape[1]
+    shifted_indices = torch.where(mask, shifted_indices, torch.tensor(0))[2:]
+    shifted_indices = shifted_indices.to(torch.int64)
+
+    return t_clean_text, shifted_indices
+
+def process_inputs(data, tokenizer):
+    text_with_tokens, clean_text = data['processed_text'], data['clean_processed_text']
+    tokenized_text, indices = _tokenize_inputs(text_with_tokens, clean_text, tokenizer)
+
+    # Due to text truncation
+    labels = torch.tensor(data['simple_labels']) # 1 for good, -1 for bad, -torch.inf for neutral/nothing
+    label_tensor = torch.scatter(torch.full(tokenized_text['input_ids'].squeeze().shape, 0, dtype=labels.dtype), -1, indices, labels)
+
+    tokenized_text['input_ids'] = tokenized_text['input_ids'].squeeze()
+    tokenized_text['attention_mask'] = tokenized_text['attention_mask'].squeeze()
+    tokenized_text['label_tensor'] = label_tensor
+
+    return tokenized_text
 
 
 def create_dataset_split(current_dataset, raw_dataset, train_phase, tokenizer,
@@ -234,6 +286,16 @@ def create_dataset_split(current_dataset, raw_dataset, train_phase, tokenizer,
                     filtered += 1
         print(f'Creating dataset {raw_dataset.dataset_name_clean} '
               f'for {train_phase=} size={len(prompt_dataset)} {filtered=}')
+        
+
+    elif train_phase == "DPO": #TODO: make this work
+        for i, tmp_data in enumerate(current_dataset):
+            # prompt = raw_dataset.get_prompt(tmp_data)
+            prompt_token = process_inputs(tmp_data, tokenizer)
+            prompt_dataset.append(prompt_token)
+    
+        print(f'Creating dataset {raw_dataset.dataset_name_clean} '
+              f'for {train_phase=} size={len(prompt_dataset)}')
 
     return PromptDataset(prompt_dataset, chosen_dataset, reject_dataset,
                          tokenizer.pad_token_id, train_phase)
@@ -244,25 +306,32 @@ def create_dataset(local_rank, dataset_name, data_split, output_path,
                    max_seq_len, rebuild):
     raw_dataset = get_raw_dataset(dataset_name, output_path, seed, local_rank)
     train_dataset = raw_dataset.get_train_data()
+
+
+    cds_phase = train_phase
+
+    if train_phase == "DPO":
+        train_phase = 1
+
     train_index = get_raw_dataset_split_index(local_rank, output_path,
-                                              raw_dataset.dataset_name_clean,
-                                              seed, "train", data_split,
-                                              train_phase - 1,
-                                              len(train_dataset), rebuild)
+                                            raw_dataset.dataset_name_clean,
+                                            seed, "train", data_split,
+                                            train_phase - 1,
+                                            len(train_dataset), rebuild)
     train_dataset = Subset(train_dataset, train_index)
     train_dataset = create_dataset_split(train_dataset, raw_dataset,
-                                         train_phase, tokenizer,
-                                         end_of_conversation_token,
-                                         max_seq_len)
+                                        cds_phase, tokenizer,
+                                        end_of_conversation_token,
+                                        max_seq_len)
 
     eval_dataset = raw_dataset.get_eval_data()
     eval_index = get_raw_dataset_split_index(local_rank, output_path,
-                                             raw_dataset.dataset_name_clean,
-                                             seed, "eval",
-                                             data_split, train_phase - 1,
-                                             len(eval_dataset), rebuild)
+                                            raw_dataset.dataset_name_clean,
+                                            seed, "eval",
+                                            data_split, train_phase - 1,
+                                            len(eval_dataset), rebuild)
     eval_dataset = Subset(eval_dataset, eval_index)
-    eval_dataset = create_dataset_split(eval_dataset, raw_dataset, train_phase,
+    eval_dataset = create_dataset_split(eval_dataset, raw_dataset, cds_phase,
                                         tokenizer, end_of_conversation_token,
                                         max_seq_len)
     return train_dataset, eval_dataset
@@ -278,7 +347,7 @@ def create_prompt_dataset(local_rank,
                           max_seq_len,
                           end_of_conversation_token="<|endoftext|>",
                           sft_only_data_path=[],
-                          reload=False):
+                          reload=True,):
     """
     Creates the prompt dataset
     """
@@ -288,6 +357,7 @@ def create_prompt_dataset(local_rank,
     tokenizer_name = tokenizer.init_kwargs["name_or_path"].replace("/", "_")
     fname = f"{fname}_split{data_split}_phase{train_phase}_seed{seed}_tokenizer{tokenizer_name}_seqlen{max_seq_len}_sft{sft_cache_key}"
     fname = "_".join(fname.split("/"))
+    # print(f"fname={fname}")
     fname = hashlib.sha256(fname.encode()).hexdigest(
     )  # hash the file name to avoid too long file name
     train_fname = f"{output_path}/traindata_{fname}.pt"

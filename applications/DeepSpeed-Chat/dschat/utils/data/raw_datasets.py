@@ -1,9 +1,8 @@
 # Copyright (c) Microsoft Corporation.
 # SPDX-License-Identifier: Apache-2.0
 
-import os
 # DeepSpeed Team
-from datasets import load_dataset, load_from_disk
+from datasets import load_dataset, Dataset
 from torch.utils.data import Subset
 import re
 
@@ -16,10 +15,11 @@ class PromptRawDataset(object):
         self.output_path = output_path
         self.seed = seed
         self.local_rank = local_rank
-        if os.path.exists(dataset_name):
-            self.raw_datasets = load_from_disk(dataset_name)
-        elif not dataset_name == 'local/jsonfile':
-            self.raw_datasets = load_dataset(dataset_name)
+        if not dataset_name == 'local/jsonfile':
+            try:
+                self.raw_datasets = load_dataset(dataset_name)
+            except:
+                self.raw_datasets = load_dataset(dataset_name, 'main')
 
     def get_train_data(self):
         return
@@ -696,6 +696,114 @@ class CohereMiracljaqueries2212Dataset(PromptRawDataset):
             return " Human: " + sample['query'] + " Assistant: " + sample[
                 'negative_passages'][0]['text']
         return None
+    
+
+class gsm8k(PromptRawDataset):
+    
+    def __init__(self, output_path, seed, local_rank, dataset_name):
+        super().__init__(output_path, seed, local_rank, dataset_name)
+        
+        self.dataset_name = "gsm8k"
+        self.real_dataset_name = "gsm"
+        self.dataset_name_clean = "gsm8k"
+        self.raw_datasets = load_dataset("gsm8k", 'main')
+        # self.sketchy_eval = load_dataset("sarahpann/GSM8K_Test")
+        
+    def get_eval_data(self):
+        return self.raw_datasets["test"]
+        
+    def get_train_data(self):
+        return self.raw_datasets["train"]
+    
+    def get_prompt(self, sample):
+        return "Human: " + sample['question'] + " Assistant:"
+    
+    
+class prm800ktrain(PromptRawDataset):
+     
+    def __init__(self, output_path, seed, local_rank, dataset_name):
+        super().__init__(output_path, seed, local_rank, dataset_name)
+        self.dataset_name = "sarahpann/PRM800K"
+        self.dataset_name_clean = "PRM800K"
+        self.raw_datasets = load_dataset("sarahpann/PRM800K")
+         
+    def get_train_data(self):
+        return self.raw_datasets["train"]
+    
+    def get_eval_data(self):
+        return self.raw_datasets["test"]
+    
+    def get_prompt(self, sample):
+        return "Human: " + sample['question']['problem'] + " Assistant:"
+    
+class prm800ksimplified(PromptRawDataset):
+         
+        def __init__(self, output_path, seed, local_rank, dataset_name):
+            super().__init__(output_path, seed, local_rank, dataset_name) 
+            self.dataset_name = "sarahpann/PRM800K_simplified"
+            self.dataset_name_clean = "PRM800K_simplified"
+            self.raw_datasets = load_dataset("sarahpann/PRM800K_simplified")
+             
+        def get_train_data(self):
+            return self.raw_datasets["train"]
+        
+        def get_eval_data(self):
+            return self.raw_datasets["test"]
+        
+        # def get_prompt(self, sample):
+        #     return "Human: " + sample['question']['problem'] + " Assistant:"
+
+class MATH(PromptRawDataset):
+    def __init__(self, output_path, seed, local_rank, dataset_name):
+        super().__init__(output_path, seed, local_rank, dataset_name)
+        self.dataset_name = "sarahpann/MATH"
+        self.dataset_name_clean = "MATH"
+        self.raw_datasets = load_dataset("sarahpann/MATH")
+         
+    def get_train_data(self):
+        return self.raw_datasets["train"]
+    
+    def get_eval_data(self):
+        return self.raw_datasets['validation']
+        # return self.raw_datasets["validation_short"]
+    
+    def make_prompt(self, data):
+        problem = data['problem']
+        solution = data['solution']
+        prompt = "Human: " + problem + " Assistant: "
+        
+        steps = re.split(r'(Step \d+\..+?)(?=(?:Step \d+\.|\Z))', solution)
+        
+        for step in steps:
+            prompt += "\n" + step
+            
+        return prompt
+    
+    def get_prompt(self, sample):
+        return "Human: " + sample['problem'] + " Assistant: "
+    
+    def get_prompt_and_chosen(self, sample):
+        return self.make_prompt(sample)
+    
+    
+class AMPS(PromptRawDataset):
+    def __init__(self, output_path, seed, local_rank, dataset_name):
+        super().__init__(output_path, seed, local_rank, dataset_name)
+        self.dataset_name = "sarahpann/AMPS"
+        self.dataset_name_clean = "AMPS"
+        self.raw_datasets = load_dataset("sarahpann/AMPS")
+         
+    def get_train_data(self):
+        return self.raw_datasets["train"]
+    
+    def get_eval_data(self):
+        return self.raw_datasets["validation"]
+    
+    def get_prompt(self, sample):
+        return "Human: " + sample['problem'] + " Assistant: "
+    
+    def get_prompt_and_chosen(self, sample):
+        return "Human: " + sample['problem'] + " Assistant: " + sample['step_by_step']
 
 
 # Japanese dataset

@@ -5,6 +5,7 @@
 # DeepSpeed Team
 import argparse
 import math
+import time
 
 import torch
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
@@ -27,6 +28,11 @@ from dschat.utils.ds_utils import get_train_ds_config
 from dschat.utils.module.lora import convert_linear_layer_to_lora, convert_lora_to_linear_layer, only_optimize_lora_parameters, make_model_gradient_checkpointing_compatible
 from dschat.utils.model.model_utils import create_hf_model, causal_lm_model_to_fp32_loss
 from dschat.utils.perf import print_throughput
+
+import wandb
+
+from wandb_login import LOGIN_KEY
+# wandb.login(key=LOGIN_KEY)
 
 
 def parse_args():
@@ -270,7 +276,8 @@ def main():
         args.seed,
         tokenizer,
         args.max_seq_len,
-        sft_only_data_path=args.sft_only_data_path)
+        sft_only_data_path=args.sft_only_data_path,
+        reload=True,)
     # DataLoaders creation:
     if args.local_rank == -1:
         train_sampler = RandomSampler(train_dataset)
@@ -298,10 +305,11 @@ def main():
             loss = outputs.loss
             losses += loss.float()
         losses = losses / (step + 1)
-        try:
-            losses = get_all_reduce_mean(losses)
-        except:
-            pass
+        # try:
+        #     losses = get_all_reduce_mean(losses)
+        # except:
+        #     pass
+        losses = get_all_reduce_mean(losses)
         try:
             perplexity = torch.exp(losses).item()
         except OverflowError:
@@ -338,20 +346,50 @@ def main():
         model.gradient_checkpointing_enable()
 
     # Train!
+    global_step = 0
+
+    if torch.distributed.get_rank() == 0:
+        project_name = "sft_amps_llama7b" if "amps" in args.data_path[0].lower() else "sft_math_llama7b"
+        run = wandb.init(project=project_name, config = {"learning_rate": args.learning_rate,
+                                                                "batch_size": args.per_device_train_batch_size, 
+                                                                "num_epochs": args.num_train_epochs, 
+                                                                "max_seq_len": args.max_seq_len, 
+                                                                "gradient_accumulation_steps": args.gradient_accumulation_steps, 
+                                                                "lr_scheduler_type": args.lr_scheduler_type, 
+                                                                "num_warmup_steps": args.num_warmup_steps, 
+                                                                "weight_decay": args.weight_decay, 
+                                                                "lora_dim": args.lora_dim, 
+                                                                "lora_learning_rate": args.lora_learning_rate})
+
+
     print_rank_0("***** Running training *****", args.global_rank)
-    print_rank_0(
-        f"***** Evaluating perplexity, Epoch {0}/{args.num_train_epochs} *****",
-        args.global_rank)
-    perplexity, eval_loss = evaluation(model, eval_dataloader)
-    print_rank_0(f"ppl: {perplexity}, loss: {eval_loss}", args.global_rank)
+    # print_rank_0(
+    #     f"***** Evaluating perplexity, Epoch {0}/{args.num_train_epochs} *****",
+    #     args.global_rank)
+    # perplexity, eval_loss = evaluation(model, eval_dataloader)
+    # print_rank_0(f"ppl: {perplexity}, loss: {eval_loss}", args.global_rank)
+
+    model.train()
+    print("NUMBER OF TRAINABLE PARAMETERS: ", sum(p.numel() for p in model.parameters() if p.requires_grad))
 
     for epoch in range(args.num_train_epochs):
         print_rank_0(
             f"Beginning of Epoch {epoch+1}/{args.num_train_epochs}, Total Micro Batches {len(train_dataloader)}",
             args.global_rank)
         model.train()
-        import time
         for step, batch in enumerate(train_dataloader):
+            if global_step % 382 == 0:
+                print_rank_0(
+                    f"***** Evaluating perplexity, Epoch {epoch+1}/{args.num_train_epochs} *****",
+                    args.global_rank)
+                perplexity, eval_loss = evaluation(model, eval_dataloader)
+                print_rank_0(f"ppl: {perplexity}, loss: {eval_loss}", args.global_rank)
+                if torch.distributed.get_rank() == 0:
+                    wandb.log({"perplexity": perplexity}, step=global_step)
+                    wandb.log({"eval_loss": eval_loss}, step=global_step)
+                model.train()
+            if step == 0:
+                print(tokenizer.decode(batch['input_ids'][0], skip_special_tokens=False))
             start = time.time()
             batch = to_device(batch, device)
             outputs = model(**batch, use_cache=False)
@@ -360,19 +398,24 @@ def main():
                 print(
                     f"Epoch: {epoch}, Step: {step}, Rank: {torch.distributed.get_rank()}, loss = {loss}"
                 )
+            if torch.distributed.get_rank() == 0:
+                wandb.log({"loss": loss}, step=global_step)
             model.backward(loss)
             model.step()
             end = time.time()
             if torch.distributed.get_rank() == 0:
                 print_throughput(model.model, args, end - start,
                                  args.global_rank)
-
+            global_step += 1
         # Evaluate perplexity on the validation set.
         print_rank_0(
             f"***** Evaluating perplexity, Epoch {epoch+1}/{args.num_train_epochs} *****",
             args.global_rank)
         perplexity, eval_loss = evaluation(model, eval_dataloader)
         print_rank_0(f"ppl: {perplexity}, loss: {eval_loss}", args.global_rank)
+        if torch.distributed.get_rank() == 0:
+            wandb.log({"perplexity": perplexity}, step=global_step)
+            wandb.log({"eval_loss": eval_loss}, step=global_step)
         model.tput_timer.update_epoch_count()
 
     if args.output_dir is not None:
